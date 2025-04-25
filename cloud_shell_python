@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+import paramiko
+import os
+import subprocess
+import re
+import json
+import time
+import sys
+
+def run_command(command, verbose=True):
+    """Run local command and return output"""
+    if verbose:
+        print(f"Executing command: {command}")
+    
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    stdout, stderr = process.communicate()
+    
+    if verbose and stdout:
+        print(f"Standard output:\n{stdout}")
+    if verbose and stderr:
+        print(f"Error output:\n{stderr}")
+    
+    return process.returncode, stdout, stderr
+
+def get_cloud_shell_info():
+    """Get Cloud Shell connection information"""
+    print("Getting Cloud Shell connection information...")
+    
+    # 1. Ensure alpha component is installed
+    code, stdout, stderr = run_command("gcloud components list --format='value(id,state)' | grep alpha", verbose=False)
+    if "alpha Installed" not in stdout:
+        print("Installing gcloud alpha component...")
+        run_command("echo 'Y' | gcloud components install alpha")
+    
+    # 2. Get SSH command information
+    print("Getting SSH connection information...")
+    print("\n=== Starting dry-run command ===")
+    code, stdout, stderr = run_command("gcloud alpha cloud-shell ssh --authorize-session --dry-run", verbose=False)
+    
+    print("Complete command output:")
+    print("Standard output:")
+    print("-" * 50)
+    print(stdout)
+    print("-" * 50)
+    print("Error output:")
+    print("-" * 50)
+    print(stderr)
+    print("-" * 50)
+    
+    # Try different regex patterns to match connection information
+    patterns = [
+        r'-p (\d+) -i [^ ]+ -o [^ ]+ ([^@]+)@([^ ]+)',# current pattern
+    ]
+    
+    match = None
+    for pattern in patterns:
+        print(f"\nTrying to match pattern: {pattern}")
+        match = re.search(pattern, stdout)
+        if match:
+            print(f"Match successful!")
+            break
+        else:
+            print(f"No match")
+    
+    if not match:
+        # If connection info not found, try starting Cloud Shell
+        print("\nConnection information not found, trying to start Cloud Shell...")
+        print("\n=== Starting launch command ===")
+        code, stdout, stderr = run_command("gcloud alpha cloud-shell ssh --authorize-session --command='exit'", verbose=False)
+        print("Launch command output:")
+        print("Standard output:")
+        print("-" * 50)
+        print(stdout)
+        print("-" * 50)
+        print("Error output:")
+        print("-" * 50)
+        print(stderr)
+        print("-" * 50)
+        
+        time.sleep(5)  # Wait for Cloud Shell to start
+        
+        # Try to get connection info again
+        print("\n=== Running dry-run command again ===")
+        code, stdout, stderr = run_command("gcloud alpha cloud-shell ssh --authorize-session --dry-run", verbose=False)
+        print("Complete command output:")
+        print("Standard output:")
+        print("-" * 50)
+        print(stdout)
+        print("-" * 50)
+        print("Error output:")
+        print("-" * 50)
+        print(stderr)
+        print("-" * 50)
+        
+        # Try all patterns again
+        for pattern in patterns:
+            print(f"\nTrying to match pattern: {pattern}")
+            match = re.search(pattern, stdout)
+            if match:
+                print(f"Match successful!")
+                break
+            else:
+                print(f"No match")
+        
+        if not match:
+            raise Exception("Could not get Cloud Shell connection information")
+    
+    port = match.group(1)
+    username = match.group(2)
+    hostname = match.group(3)
+    
+    print(f"\nConnection information obtained:")
+    print(f"- Hostname: {hostname}")
+    print(f"- Port: {port}")
+    print(f"- Username: {username}")
+    
+    return {
+        "hostname": hostname,
+        "port": int(port),
+        "username": username,
+        "key_path": os.path.expanduser("~/.ssh/google_compute_engine")
+    }
+
+def connect_to_cloud_shell():
+    """Connect to Cloud Shell"""
+    # Get dynamic connection information
+    info = get_cloud_shell_info()
+    
+    print(f"\nConnecting to Cloud Shell: {info['username']}@{info['hostname']}:{info['port']}")
+    
+    # Create SSH client
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        # Connect using key
+        key = paramiko.RSAKey.from_private_key_file(info["key_path"])
+        client.connect(
+            hostname=info["hostname"],
+            port=info["port"],
+            username=info["username"],
+            pkey=key,
+            timeout=10
+        )
+        print("Successfully connected to Cloud Shell!")
+        return client
+    except Exception as e:
+        print(f"Connection failed: {str(e)}")
+        return None
+
+def create_test_script():
+    """Create test script"""
+    test_script = """
+print("Hello from Cloud Shell!")
+result = "toxic"
+print(result)
+    """
+    
+    with open("test.py", "w") as f:
+        f.write(test_script)
+
+def upload_file(client, local_path, remote_path):
+    """Upload file to Cloud Shell"""
+    print(f"Uploading file {local_path} to Cloud Shell...")
+    sftp = client.open_sftp()
+    sftp.put(local_path, remote_path)
+    sftp.close()
+    print("File uploaded successfully!")
+
+def execute_command(client, command):
+    """Execute command on Cloud Shell"""
+    print(f"Executing command: {command}")
+    stdin, stdout, stderr = client.exec_command(command)
+    
+    # Get output
+    output = stdout.read().decode().strip()
+    error = stderr.read().decode().strip()
+    
+    if output:
+        print(f"Output:\n{output}")
+    if error:
+        print(f"Error:\n{error}")
+    
+    return output, error
+
+def install_ffmpeg(client):
+    """Install ffmpeg on Cloud Shell if not already installed"""
+    print("\nChecking and installing ffmpeg on Cloud Shell...")
+    
+    # First check if ffmpeg is installed
+    _, error = execute_command(client, "ffmpeg -version")
+    
+    if "command not found" in error or "No such file or directory" in error:
+        print("ffmpeg not found. Installing ffmpeg...")
+        # Update package lists
+        execute_command(client, "sudo apt-get update")
+        # Install ffmpeg
+        execute_command(client, "sudo apt-get install -y ffmpeg")
+        print("ffmpeg installation completed.")
+    else:
+        print("ffmpeg is already installed.")
+
+def download_generated_files(client):
+    """Download generated files from Cloud Shell"""
+    print("\nDownloading generated files...")
+    sftp = client.open_sftp()
+    
+    # List of files to download
+    files_to_download = [
+        "responses_output.txt",
+        "toxicity_analysis_output.txt"  # Added new output file to download
+    ]
+    
+    for file in files_to_download:
+        try:
+            sftp.get(file, file)
+            print(f"File {file} downloaded to local machine")
+        except:
+            print(f"Warning: Could not download file {file}")
+    
+    sftp.close()
+
+def main():
+    try:
+        print("Starting Cloud Shell connection...")
+        
+        # Get command line arguments
+        if len(sys.argv) < 3:
+            print("Usage: python dynamic_cloud_shell.py <Python_file_in_Cloud_Shell> <mp3_file_path>")
+            print("Example: python dynamic_cloud_shell.py mp3totext.py example.mp3")
+            return
+            
+        python_file = sys.argv[1]  # Python file name in Cloud Shell
+        mp3_path = sys.argv[2]
+        
+        # Check if MP3 file exists
+        if not os.path.exists(mp3_path):
+            print(f"Error: MP3 file {mp3_path} does not exist")
+            return
+            
+        print(f"Will run in Cloud Shell: {python_file}")
+        print(f"Processing file: {mp3_path}")
+        
+        # Connect to Cloud Shell
+        client = connect_to_cloud_shell()
+        if not client:
+            print("Connection failed, exiting program")
+            return
+        
+        # Install ffmpeg on Cloud Shell if needed
+        install_ffmpeg(client)
+        
+        # Upload necessary files
+        print("\nUploading files...")
+        upload_file(client, mp3_path, os.path.basename(mp3_path))
+        
+        # Execute Python script
+        print("\nExecuting script...")
+        output, error = execute_command(client, f"python {python_file} {os.path.basename(mp3_path)}")
+        
+        # Download generated files
+        download_generated_files(client)
+        
+        # Close connection
+        client.close()
+        print("\nDisconnected from Cloud Shell")
+        
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main() 
